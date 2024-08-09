@@ -22,6 +22,7 @@ chat分析报告生成 | [实验性功能] 运行后自动生成总结汇报
 图片显示 | 可以在markdown中显示图片
 支持GPT输出的markdown表格 | 可以输出支持GPT的markdown表格
 
+支持ollama本地大模型 | 可以解决外网API请求依赖
 </div>
 
 - 新界面

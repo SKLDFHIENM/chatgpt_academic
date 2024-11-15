@@ -79,7 +79,7 @@ input区域 输入 ./crazy_functions/test_project/latex/attention ， 然后点�
 input区域 输入 ./crazy_functions/test_project/python/dqn ， 然后点击 解析整个Python项目
 ```
 
-###本地大模型
+###TODO 本地大模型
 ollama: http://ollama.com/
 ollama clientAPI : https://github.com/ollama/ollama-python
 

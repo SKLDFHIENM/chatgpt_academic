@@ -6,156 +6,242 @@ import logging
 import traceback
 import requests
 import importlib
+from typing import Dict, List, Tuple, Generator, Any, Optional, Union
 
-# config_private.py放自己的秘密如API和代理网址
-# 读取时首先看是否存在私密的config_private配置文件（不受git管控），如果有，则覆盖原config文件
-try: from config_private import proxies, API_URL, API_KEY, TIMEOUT_SECONDS, MAX_RETRY, LLM_MODEL
-except: from config import proxies, API_URL, API_KEY, TIMEOUT_SECONDS, MAX_RETRY, LLM_MODEL
+# Configuration loading
+def load_api_config():
+    """Load API configuration from private config if available, otherwise from public config"""
+    try:
+        from config_private import proxies, API_URL, API_KEY, TIMEOUT_SECONDS, MAX_RETRY, LLM_MODEL
+    except ImportError:
+        from config import proxies, API_URL, API_KEY, TIMEOUT_SECONDS, MAX_RETRY, LLM_MODEL
+    
+    return {
+        'proxies': proxies,
+        'api_url': API_URL,
+        'api_key': API_KEY,
+        'timeout': TIMEOUT_SECONDS,
+        'max_retry': MAX_RETRY,
+        'model': LLM_MODEL
+    }
 
-timeout_bot_msg = '[local] Request timeout, network error. please check proxy settings in config.py.'
+# Constants
+TIMEOUT_BOT_MSG = '[local] Request timeout, network error. please check proxy settings in config.py.'
 
-def get_full_error(chunk, stream_response):
+# Load configuration
+API_CONFIG = load_api_config()
+
+def get_full_error(chunk: bytes, stream_response: Generator) -> bytes:
+    """Collect all remaining chunks from a stream to get the full error message"""
     while True:
         try:
             chunk += next(stream_response)
-        except:
+        except (StopIteration, Exception):
             break
     return chunk
 
-def predict_no_ui(inputs, top_p, temperature, history=[]):
-    headers, payload = generate_payload(inputs, top_p, temperature, history, system_prompt="", stream=False)
-
-    retry = 0
-    while True:
-        try:
-            # make a POST request to the API endpoint, stream=False
-            response = requests.post(API_URL, headers=headers, proxies=proxies,
-                                    json=payload, stream=False, timeout=TIMEOUT_SECONDS*2); break
-        except requests.exceptions.ReadTimeout as e:
-            retry += 1
-            traceback.print_exc()
-            if MAX_RETRY!=0: print(f'请求超时，正在重试 ({retry}/{MAX_RETRY}) ……')
-            if retry > MAX_RETRY: raise TimeoutError
-
-    try:
-        result = json.loads(response.text)["choices"][0]["message"]["content"]
-        return result
-    except Exception as e:
-        if "choices" not in response.text: print(response.text)
-        raise ConnectionAbortedError("Json解析不合常规，可能是文本过长" + response.text)
-
-
-def predict(inputs, top_p, temperature, chatbot=[], history=[], system_prompt='', 
-            stream = True, additional_fn=None):
-
-    if additional_fn is not None:
-        import functional
-        importlib.reload(functional)
-        functional = functional.get_functionals()
-        inputs = functional[additional_fn]["Prefix"] + inputs + functional[additional_fn]["Suffix"]
-
-    if stream:
-        raw_input = inputs
-        logging.info(f'[raw_input] {raw_input}')
-        chatbot.append((inputs, ""))
-        yield chatbot, history, "等待响应"
-
-    headers, payload = generate_payload(inputs, top_p, temperature, history, system_prompt, stream)
-    history.append(inputs); history.append(" ")
-
-    retry = 0
-    while True:
-        try:
-            # make a POST request to the API endpoint, stream=True
-            response = requests.post(API_URL, headers=headers, proxies=proxies,
-                                    json=payload, stream=True, timeout=TIMEOUT_SECONDS);break
-        except:
-            retry += 1
-            chatbot[-1] = ((chatbot[-1][0], timeout_bot_msg))
-            retry_msg = f"，正在重试 ({retry}/{MAX_RETRY}) ……" if MAX_RETRY > 0 else ""
-            yield chatbot, history, "请求超时"+retry_msg
-            if retry > MAX_RETRY: raise TimeoutError
-
-    gpt_replying_buffer = ""
-    
-    is_head_of_the_stream = True
-    if stream:
-        stream_response =  response.iter_lines()
-        while True:
-            chunk = next(stream_response)
-            # print(chunk.decode()[6:])
-            if is_head_of_the_stream:
-                # 数据流的第一帧不携带content
-                is_head_of_the_stream = False; continue
-            
-            if chunk:
-                try:
-                    if len(json.loads(chunk.decode()[6:])['choices'][0]["delta"]) == 0:
-                        # 判定为数据流的结束，gpt_replying_buffer也写完了
-                        logging.info(f'[response] {gpt_replying_buffer}')
-                        break
-                    # 处理数据流的主体
-                    chunkjson = json.loads(chunk.decode()[6:])
-                    status_text = f"finish_reason: {chunkjson['choices'][0]['finish_reason']}"
-                    # 如果这里抛出异常，一般是文本过长，详情见get_full_error的输出
-                    gpt_replying_buffer = gpt_replying_buffer + json.loads(chunk.decode()[6:])['choices'][0]["delta"]["content"]
-                    history[-1] = gpt_replying_buffer
-                    chatbot[-1] = (history[-2], history[-1])
-                    yield chatbot, history, status_text
-
-                except Exception as e:
-                    traceback.print_exc()
-                    yield chatbot, history, "Json解析不合常规，很可能是文本过长"
-                    chunk = get_full_error(chunk, stream_response)
-                    error_msg = chunk.decode()
-                    if "reduce the length" in error_msg:
-                        chatbot[-1] = (history[-1], "[Local Message] Input (or history) is too long, please reduce input or clear history by refleshing this page.")
-                        history = []
-                    yield chatbot, history, "Json解析不合常规，很可能是文本过长" + error_msg
-                    return
-
-def generate_payload(inputs, top_p, temperature, history, system_prompt, stream):
+def generate_payload(
+    inputs: str,
+    top_p: float,
+    temperature: float,
+    history: List[str],
+    system_prompt: str,
+    stream: bool
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Generate API request headers and payload"""
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
+        "Authorization": f"Bearer {API_CONFIG['api_key']}"
     }
 
     conversation_cnt = len(history) // 2
 
+    # Start with system message
     messages = [{"role": "system", "content": system_prompt}]
+    
+    # Add conversation history
     if conversation_cnt:
         for index in range(0, 2*conversation_cnt, 2):
-            what_i_have_asked = {}
-            what_i_have_asked["role"] = "user"
-            what_i_have_asked["content"] = history[index]
-            what_gpt_answer = {}
-            what_gpt_answer["role"] = "assistant"
-            what_gpt_answer["content"] = history[index+1]
-            if what_i_have_asked["content"] != "":
-                if what_gpt_answer["content"] == "": continue
-                if what_gpt_answer["content"] == timeout_bot_msg: continue
-                messages.append(what_i_have_asked)
-                messages.append(what_gpt_answer)
+            user_message = {"role": "user", "content": history[index]}
+            assistant_message = {"role": "assistant", "content": history[index+1]}
+            
+            # Skip empty or timeout messages
+            if user_message["content"] != "":
+                if assistant_message["content"] == "": 
+                    continue
+                if assistant_message["content"] == TIMEOUT_BOT_MSG: 
+                    continue
+                messages.append(user_message)
+                messages.append(assistant_message)
             else:
-                messages[-1]['content'] = what_gpt_answer['content']
+                # Handle case where user message is empty but assistant message exists
+                messages[-1]['content'] = assistant_message['content']
 
-    what_i_ask_now = {}
-    what_i_ask_now["role"] = "user"
-    what_i_ask_now["content"] = inputs
-    messages.append(what_i_ask_now)
+    # Add current user input
+    messages.append({"role": "user", "content": inputs})
 
+    # Create payload
     payload = {
-        "model": LLM_MODEL,
+        "model": API_CONFIG['model'],
         "messages": messages, 
-        "temperature": temperature,  # 1.0,
-        "top_p": top_p,  # 1.0,
+        "temperature": temperature,
+        "top_p": top_p,
         "n": 1,
         "stream": stream,
         "presence_penalty": 0,
         "frequency_penalty": 0,
     }
     
-    print(f" {LLM_MODEL} : {conversation_cnt} : {inputs}")
-    return headers,payload
+    print(f" {API_CONFIG['model']} : {conversation_cnt} : {inputs}")
+    return headers, payload
+
+def predict_no_ui(
+    inputs: str,
+    top_p: float,
+    temperature: float,
+    history: List[str] = []
+) -> str:
+    """Make a prediction without UI updates (non-streaming)"""
+    headers, payload = generate_payload(
+        inputs, top_p, temperature, history, system_prompt="", stream=False
+    )
+
+    retry = 0
+    while True:
+        try:
+            # Make a POST request to the API endpoint, stream=False
+            response = requests.post(
+                API_CONFIG['api_url'],
+                headers=headers,
+                proxies=API_CONFIG['proxies'],
+                json=payload,
+                stream=False,
+                timeout=API_CONFIG['timeout'] * 2
+            )
+            break
+        except requests.exceptions.ReadTimeout:
+            retry += 1
+            traceback.print_exc()
+            if API_CONFIG['max_retry'] != 0:
+                print(f'请求超时，正在重试 ({retry}/{API_CONFIG["max_retry"]}) ……')
+            if retry > API_CONFIG['max_retry']:
+                raise TimeoutError("Maximum retry attempts exceeded")
+
+    try:
+        result = json.loads(response.text)["choices"][0]["message"]["content"]
+        return result
+    except Exception:
+        if "choices" not in response.text:
+            print(response.text)
+        raise ConnectionAbortedError("Json解析不合常规，可能是文本过长" + response.text)
+
+def predict(
+    inputs: str,
+    top_p: float,
+    temperature: float,
+    chatbot: List[Tuple[str, str]] = [],
+    history: List[str] = [],
+    system_prompt: str = '',
+    stream: bool = True,
+    additional_fn: Optional[str] = None
+) -> Generator[Tuple[List[Tuple[str, str]], List[str], str], None, None]:
+    """Make a prediction with UI updates (streaming)"""
+    # Apply additional function if specified
+    if additional_fn is not None:
+        import functional
+        importlib.reload(functional)
+        functional_modules = functional.get_functionals()
+        inputs = functional_modules[additional_fn]["Prefix"] + inputs + functional_modules[additional_fn]["Suffix"]
+
+    # Initial UI update for streaming mode
+    if stream:
+        raw_input = inputs
+        logging.info(f'[raw_input] {raw_input}')
+        chatbot.append((inputs, ""))
+        yield chatbot, history, "等待响应"
+
+    # Generate API request
+    headers, payload = generate_payload(inputs, top_p, temperature, history, system_prompt, stream)
+    history.append(inputs)
+    history.append(" ")  # Placeholder for response
+
+    # Make API request with retry logic
+    retry = 0
+    while True:
+        try:
+            response = requests.post(
+                API_CONFIG['api_url'],
+                headers=headers,
+                proxies=API_CONFIG['proxies'],
+                json=payload,
+                stream=True,
+                timeout=API_CONFIG['timeout']
+            )
+            break
+        except Exception:
+            retry += 1
+            chatbot[-1] = ((chatbot[-1][0], TIMEOUT_BOT_MSG))
+            retry_msg = f"，正在重试 ({retry}/{API_CONFIG['max_retry']}) ……" if API_CONFIG['max_retry'] > 0 else ""
+            yield chatbot, history, "请求超时" + retry_msg
+            if retry > API_CONFIG['max_retry']:
+                raise TimeoutError("Maximum retry attempts exceeded")
+
+    # Process streaming response
+    if stream:
+        gpt_replying_buffer = ""
+        is_head_of_the_stream = True
+        stream_response = response.iter_lines()
+        
+        while True:
+            try:
+                chunk = next(stream_response)
+                
+                # Skip the first frame which doesn't contain content
+                if is_head_of_the_stream:
+                    is_head_of_the_stream = False
+                    continue
+                
+                if not chunk:
+                    continue
+                    
+                try:
+                    # Parse the chunk
+                    chunk_data = json.loads(chunk.decode()[6:])
+                    
+                    # Check if this is the end of the stream
+                    if len(chunk_data['choices'][0]["delta"]) == 0:
+                        logging.info(f'[response] {gpt_replying_buffer}')
+                        break
+                    
+                    # Process the main body of the data stream
+                    status_text = f"finish_reason: {chunk_data['choices'][0]['finish_reason']}"
+                    
+                    # Update the reply buffer with new content
+                    gpt_replying_buffer += chunk_data['choices'][0]["delta"]["content"]
+                    history[-1] = gpt_replying_buffer
+                    chatbot[-1] = (history[-2], history[-1])
+                    
+                    yield chatbot, history, status_text
+                    
+                except Exception as e:
+                    # Handle parsing errors
+                    traceback.print_exc()
+                    yield chatbot, history, "Json解析不合常规，很可能是文本过长"
+                    
+                    # Get the full error message
+                    chunk = get_full_error(chunk, stream_response)
+                    error_msg = chunk.decode()
+                    
+                    # Handle specific error cases
+                    if "reduce the length" in error_msg:
+                        chatbot[-1] = (history[-1], "[Local Message] Input (or history) is too long, please reduce input or clear history by refleshing this page.")
+                        history = []
+                        
+                    yield chatbot, history, "Json解析不合常规，很可能是文本过长" + error_msg
+                    return
+                    
+            except StopIteration:
+                # End of stream
+                break
 
 
